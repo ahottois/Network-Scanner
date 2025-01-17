@@ -22,6 +22,8 @@ class NetworkDevice:
         self.owner = ""
         self.location = ""
         self.notes = ""
+        self.is_new = False  
+        self.is_known = False  
 
 devices = {}
 device_data = {}
@@ -36,6 +38,59 @@ def load_device_data():
 def save_device_data(data):
     with open('device_data.json', 'w') as f:
         json.dump(data, f, indent=4)
+
+def scan_network():
+    nm = nmap.PortScanner()
+    
+    while True:
+        try:
+            interfaces = netifaces.interfaces()
+            for interface in interfaces:
+                if interface != 'lo':  # Ignorer l'interface loopback
+                    addrs = netifaces.ifaddresses(interface)
+                    if netifaces.AF_INET in addrs:
+                        for addr in addrs[netifaces.AF_INET]:
+                            ip = addr['addr']
+                            subnet = ip.rsplit('.', 1)[0] + '.0/24'
+                            
+                            nm.scan(hosts=subnet, arguments='-sn')
+                            
+                            for host in nm.all_hosts():
+                                try:
+                                    hostname = socket.gethostbyaddr(host)[0]
+                                except socket.herror:
+                                    hostname = "Unknown"
+
+                                if host not in devices:
+                                    devices[host] = NetworkDevice(host)
+                                    devices[host].is_new = True
+
+                                devices[host].hostname = hostname
+                                devices[host].status = 'online' if nm[host].state() == 'up' else 'offline'
+                                devices[host].last_seen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                
+                                if 'mac' in nm[host]['addresses']:
+                                    devices[host].mac = nm[host]['addresses']['mac']
+
+                                # Initialiser les données si non présentes
+                                if host not in device_data:
+                                    device_data[host] = {
+                                        "device_type": "Inconnu",
+                                        "owner": "Inconnu",
+                                        "location": "Inconnu",
+                                        "notes": "",
+                                        "is_known": False
+                                    }
+                                else:
+                                    devices[host].is_known = device_data[host].get('is_known', False)
+
+                                print(f"Found device: {devices[host].ip} ({devices[host].hostname}) - {devices[host].status}")
+
+            time.sleep(300)
+
+        except Exception as e:
+            print(f"Error during scan: {str(e)}")
+            time.sleep(60)
 
 device_data = load_device_data()
 
@@ -100,20 +155,33 @@ HTML_TEMPLATE = '''
         }
 
         .status-badge.online {
-            background-color: #2ecc71; /* Vert pour en ligne */
+            background-color: #2ecc71;
         }
 
         .status-badge.offline {
-            background-color: #e74c3c; /* Rouge pour hors ligne */
+            background-color: #e74c3c;
         }
 
-        .device-info {
-            font-size: 12px;
-            color: #666;
-            margin-top: 5px;
+        .new-device {
+            color: red;
         }
 
-        /* Styles pour le modal */
+        .new-device::after {
+            content: " !";
+            font-weight: bold;
+            color: red;
+        }
+
+        .known-device {
+            color: green;
+        }
+
+        .known-device::after {
+            content: " ✓";
+            font-weight: bold;
+            color: green;
+        }
+
         .modal {
             display: none;
             position: fixed;
@@ -145,10 +213,6 @@ HTML_TEMPLATE = '''
             color: #aaa;
         }
 
-        .close:hover {
-            color: #555;
-        }
-
         .form-group {
             margin-bottom: 15px;
         }
@@ -168,12 +232,8 @@ HTML_TEMPLATE = '''
             font-size: 14px;
         }
 
-        .form-group textarea {
-            resize: vertical;
-        }
-
         .save-button {
-            background: #2980b9;
+            background-color: #2980b9;
             color: white;
             border: none;
             padding: 10px 20px;
@@ -183,26 +243,13 @@ HTML_TEMPLATE = '''
         }
 
         .save-button:hover {
-            background: #21618c;
-        }
-
-        @media (max-width: 600px) {
-            .modal-content {
-                width: 90%;
-            }
+            background-color: #2471a3;
         }
     </style>
     <script>
-        function refreshPage() {
-            location.reload();
-        }
-
-        setInterval(refreshPage, 30000);
-
         function openModal(ip) {
-            const modal = document.getElementById('deviceModal');
-            modal.style.display = 'block';
-
+            document.getElementById('deviceModal').style.display = 'block';
+            
             fetch(`/api/device/${ip}`)
                 .then(response => response.json())
                 .then(data => {
@@ -211,6 +258,7 @@ HTML_TEMPLATE = '''
                     document.getElementById('deviceOwner').value = data.owner || '';
                     document.getElementById('deviceLocation').value = data.location || '';
                     document.getElementById('deviceNotes').value = data.notes || '';
+                    document.getElementById('isKnown').checked = data.is_known || false;
                     document.getElementById('saveButton').onclick = () => saveDeviceData(ip);
                 });
         }
@@ -224,7 +272,8 @@ HTML_TEMPLATE = '''
                 device_type: document.getElementById('deviceType').value,
                 owner: document.getElementById('deviceOwner').value,
                 location: document.getElementById('deviceLocation').value,
-                notes: document.getElementById('deviceNotes').value
+                notes: document.getElementById('deviceNotes').value,
+                is_known: document.getElementById('isKnown').checked
             };
 
             fetch(`/api/device/${ip}`, {
@@ -235,14 +284,14 @@ HTML_TEMPLATE = '''
                 body: JSON.stringify(data)
             })
             .then(response => response.json())
-            .then(result => {
-                if(result.status === 'success') {
-                    closeModal();
-                    refreshPage();
+            .then(data => {
+                if(data.status === 'success') {
+                    location.reload();
                 }
             });
         }
 
+        // Fermer le modal en cliquant en dehors
         window.onclick = function(event) {
             const modal = document.getElementById('deviceModal');
             if (event.target == modal) {
@@ -267,7 +316,7 @@ HTML_TEMPLATE = '''
             </thead>
             <tbody>
                 {% for device in devices.values() %}
-                <tr onclick="openModal('{{ device.ip }}')">
+                <tr onclick="openModal('{{ device.ip }}')" class="{% if device.is_known %}known-device{% elif device.is_new %}new-device{% endif %}">
                     <td>{{ device.ip }}</td>
                     <td>{{ device.hostname }}</td>
                     <td>{{ device.mac }}</td>
@@ -319,67 +368,16 @@ HTML_TEMPLATE = '''
                 <label for="deviceNotes">Notes</label>
                 <textarea id="deviceNotes" placeholder="Ajouter des notes..."></textarea>
             </div>
+            <div class="form-group">
+                <label for="isKnown">Connu</label>
+                <input type="checkbox" id="isKnown"> Cet appareil est connu.
+            </div>
             <button class="save-button" id="saveButton">Enregistrer</button>
         </div>
     </div>
 </body>
 </html>
 '''
-
-def get_network_info():
-    for interface in netifaces.interfaces():
-        addrs = netifaces.ifaddresses(interface)
-        if netifaces.AF_INET in addrs:
-            for addr in addrs[netifaces.AF_INET]:
-                ip = addr['addr']
-                if not ip.startswith('127.'):
-                    return ip, addr['netmask']
-    return None, None
-
-def scan_network():
-    while True:
-        try:
-            nm = nmap.PortScanner()
-            ip, netmask = get_network_info()
-            if ip:
-                network = f"{ip}/24"
-                print(f"Scanning network: {network}")
-
-                nm.scan(hosts=network, arguments='-sn')
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                for host in nm.all_hosts():
-                    if host not in devices:
-                        devices[host] = NetworkDevice(host)
-                    device = devices[host]
-                    device.status = 'online' if nm[host].state() == 'up' else 'offline'
-                    device.last_seen = current_time
-                    
-                    # Tentative d'obtenir le nom de l'hôte
-                    try:
-                        device.hostname = socket.gethostbyaddr(host)[0]
-                    except socket.herror:
-                        device.hostname = "Unknown"
-
-                    # Récupérer l'adresse MAC
-                    device.mac = nm[host]['addresses'].get('mac', '')
-
-                    # Initialiser les données si non présentes
-                    if host not in device_data:
-                        device_data[host] = {
-                            "device_type": "Inconnu",
-                            "owner": "Inconnu",
-                            "location": "Inconnu",
-                            "notes": ""
-                        }
-
-                    print(f"Found device: {device.ip} ({device.hostname}) - {device.status}")
-
-            time.sleep(300)
-
-        except Exception as e:
-            print(f"Error during scan: {str(e)}")
-            time.sleep(60)
 
 @app.route('/api/device/<ip>', methods=['GET'])
 def get_device(ip):
